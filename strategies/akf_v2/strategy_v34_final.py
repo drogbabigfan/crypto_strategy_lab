@@ -9,56 +9,59 @@ Position Sizing 모델 변경:
 
 Gaussian Parameters:
 - max_mult = 2.0 (최대 배율)
-- σ = 0.3 (민감도)
+- σ = 0.5 (민감도) - T=7, H=7 스탑에 맞게 조정
 
 특성:
 - unc_pct=0 → 2.0x (풀 사이즈)
-- unc_pct=0.3 → 1.21x
-- unc_pct=0.5 → 0.50x
-- unc_pct=0.7 → 0.13x (거의 진입 안함)
+- unc_pct=0.3 → 1.67x
+- unc_pct=0.5 → 1.21x
+- unc_pct=0.7 → 0.76x
 
-"The Sniper" 접근법:
-- 확신 높을 때만 큰 포지션
-- 불확실성 조금만 올라도 급격히 축소
+스탑 거리(5→7σ)가 넓어지면서 base_size 감소 보완:
+- σ=0.3 → σ=0.5로 조정하여 적절한 레버리지 유지
 
 === 진입 ===
 - vel_zscore > 2.0 & unc_pct < 0.5
 
 === 청산 (우선순위) ===
-1. Hard Stop: entry × exp(-5 × σ_entry)
-2. Trailing Stop: highest × exp(-dynamic_mult × σ) with Ratchet
+1. Hard Stop: entry × exp(-7 × σ_entry) - low/high 기준 (장중 터치 시 청산)
+2. Trailing Stop: highest × exp(-dynamic_mult × σ) with Ratchet - low/high 기준
+   - dynamic_mult = 7.0 / v_ratio (clipped to [1.25, 10.5])
 3. Innovation Breaker: |residual| > innov_mult × resid_std (v_ratio ≥ 1.0)
 4. Signal Exit: vel_zscore 반전 (v_ratio < 1.0 AND Intensity < 4.0)
 
 === Dynamic Sizing (Gaussian) ===
 1. Base Size = Risk_Target / Hard_Stop_Distance
    - Risk Target: 3%
-   - Hard Stop Distance: 5 × σ_hybrid
+   - Hard Stop Distance: 7 × σ_hybrid
 
 2. Gaussian Scaling
-   - M = 2.0 × exp(-unc_pct² / (2 × 0.3²))
+   - M = 2.0 × exp(-unc_pct² / (2 × 0.5²))
    - unc_pct 낮을수록 → 최대 2.0배
-   - unc_pct 높을수록 → 급격히 감소
+   - unc_pct 높을수록 → 점진적 감소
 
 3. Final Size = clip(Base × M, 0.1, 3.0)
 
-=== 성능 (V3.4 Gaussian vs V3.3 Baseline) ===
+=== 성능 (V3.4 - low/high 스탑, T=7, H=7, σ=0.5) ===
 
 개별 자산:
-              V3.3 PnL    V3.4 PnL    Δ PnL
-- BTC:        483%        737%        +254%
-- ETH:        186%        125%        -61%
-- XRP:        135%        216%        +82%
-- SOL:        394%        518%        +124%
+              CAGR        MDD         CAGR/MDD
+- BTC:        29.2%       14.8%       1.97
+- ETH:        6.0%        34.5%       0.17
+- XRP:        8.3%        49.4%       0.17
+- SOL:        15.0%       30.5%       0.49
 
 4-Asset Combined (레버리지 누적):
-              V3.3        V3.4        개선
-- Total PnL:  7,542%      13,060%     +73.2%
-- CAGR:       77.9%       91.2%       +17.1%
-- MDD:        30.8%       34.2%       +11.2%
-- CAGR/MDD:   2.53        2.66        +5.3%
-- Sharpe:     1.00        0.94        -6.0%
-- Avg Lev:    2.56x       2.87x       +12.4%
+- CAGR:       60.2%
+- MDD:        36.2%
+- CAGR/MDD:   1.66
+- Sharpe:     1.20
+- Avg Lev:    2.41x
+
+특징:
+- 현실적 스탑 체크 (low/high 기준)
+- 과최적화 방지 (깔끔한 파라미터: T=7, H=7, M=2.0, σ=0.5)
+- 포트폴리오 CAGR/MDD 1.66 (안정적)
 """
 
 import sys
@@ -89,9 +92,9 @@ V34_PARAMS = {
     "warmup": 210,
 
     # Trailing Stop (v_ratio 기반 동적)
-    "trail_base_mult": 5.0,
+    "trail_base_mult": 7.0,
     "trail_mult_min": 1.25,
-    "trail_mult_max": 7.5,
+    "trail_mult_max": 10.5,
 
     # Innovation Breaker (v_ratio 기반 동적)
     "v_ratio_threshold": 1.0,
@@ -100,12 +103,12 @@ V34_PARAMS = {
     "innov_mult_max": 4.0,
 
     # Hard Stop
-    "hard_stop_mult": 5.0,
+    "hard_stop_mult": 7.0,
 
     # Dynamic Sizing (Gaussian)
     "risk_target": 0.03,        # 3%
     "gauss_max_mult": 2.0,      # 최대 배율
-    "gauss_sigma": 0.3,         # Gaussian σ (민감도)
+    "gauss_sigma": 0.5,         # Gaussian σ (민감도)
     "size_min": 0.1,
     "size_max": 3.0,
 
@@ -356,12 +359,12 @@ def generate_signals(
             stop_prices[i] = max(trail_stop, hard_stop)
 
             # Exit checks (우선순위)
-            # 1. Hard Stop
-            if close[i] < hard_stop:
+            # 1. Hard Stop (low 기준 - 장중 터치 시 청산)
+            if low[i] < hard_stop:
                 position = 0
                 continue
-            # 2. Trailing Stop
-            if close[i] < trail_stop:
+            # 2. Trailing Stop (low 기준 - 장중 터치 시 청산)
+            if low[i] < trail_stop:
                 position = 0
                 continue
             # 3. Innovation Breaker (v_ratio >= threshold)
@@ -392,12 +395,12 @@ def generate_signals(
             stop_prices[i] = min(trail_stop, hard_stop)
 
             # Exit checks (우선순위)
-            # 1. Hard Stop
-            if close[i] > hard_stop:
+            # 1. Hard Stop (high 기준 - 장중 터치 시 청산)
+            if high[i] > hard_stop:
                 position = 0
                 continue
-            # 2. Trailing Stop
-            if close[i] > trail_stop:
+            # 2. Trailing Stop (high 기준 - 장중 터치 시 청산)
+            if high[i] > trail_stop:
                 position = 0
                 continue
             # 3. Innovation Breaker (v_ratio >= threshold)
@@ -574,7 +577,7 @@ def main():
         print(f"  Avg Sharpe:  {portfolio_avg_sharpe:.2f}")
         print(f"  Avg PnL:     {portfolio_avg_pnl*100:.1f}%")
         print(f"  Avg MDD:     {portfolio_avg_mdd*100:.1f}%")
-        print(f"  (레버리지 누적 시: PnL ~13,060%, CAGR ~91.2%, MDD ~34.2%)")
+        print(f"  (레버리지 누적 시: CAGR ~60.2%, MDD ~36.2%, CAGR/MDD ~1.66)")
 
 
 if __name__ == "__main__":
