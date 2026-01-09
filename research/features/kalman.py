@@ -95,19 +95,17 @@ class AdaptiveKalmanFilter:
         # z = [1  0] * [trend, velocity]^T
         self.H = np.array([[1.0, 0.0]])
 
-    def _estimate_r(self, prices: np.ndarray, idx: int) -> float:
+    def _estimate_r_close(self, prices: np.ndarray, idx: int) -> float:
         """
-        Estimate measurement noise R_t from recent price variance.
-
-        Uses Parkinson-style high-low range if available,
-        otherwise falls back to close-to-close variance.
+        Estimate measurement noise R_trend from close-to-close variance.
+        Used for state update (smooth trend tracking).
 
         Args:
-            prices: Price array (can be 1D or 2D with OHLC)
+            prices: Close price array (log space)
             idx: Current index
 
         Returns:
-            Estimated R_t
+            Estimated R_trend
         """
         window = self.config.r_window
         start = max(0, idx - window + 1)
@@ -116,16 +114,52 @@ class AdaptiveKalmanFilter:
             return self.config.initial_p * self.config.r_scale
 
         recent = prices[start:idx + 1]
-
-        # Filter out NaN values
         recent_valid = recent[~np.isnan(recent)]
 
         if len(recent_valid) < 2:
             return self.config.initial_p * self.config.r_scale
 
-        # Variance of price changes (NaN-safe)
         returns = np.diff(recent_valid)
         r = np.var(returns) if len(returns) > 0 else self.config.initial_p
+
+        return max(r * self.config.r_scale, self.config.min_r)
+
+    def _estimate_r_parkinson(
+        self,
+        log_high: np.ndarray,
+        log_low: np.ndarray,
+        idx: int
+    ) -> float:
+        """
+        Estimate measurement noise R_risk from Parkinson volatility.
+        Used for stop distance calculation (accounts for intrabar wicks).
+
+        Parkinson Volatility: σ² = (1/4ln2) × mean[(ln(H) - ln(L))²]
+
+        Args:
+            log_high: Log of high prices
+            log_low: Log of low prices
+            idx: Current index
+
+        Returns:
+            Estimated R_risk (Parkinson-based)
+        """
+        window = self.config.r_window
+        start = max(0, idx - window + 1)
+
+        if start >= idx:
+            return self.config.initial_p * self.config.r_scale
+
+        # High-Low range in log space
+        log_range = log_high[start:idx + 1] - log_low[start:idx + 1]
+        valid_range = log_range[~np.isnan(log_range)]
+
+        if len(valid_range) < 2:
+            return self.config.initial_p * self.config.r_scale
+
+        # Parkinson variance: (1/4ln2) × mean(range²)
+        parkinson_factor = 1.0 / (4.0 * np.log(2.0))
+        r = parkinson_factor * np.mean(valid_range ** 2)
 
         return max(r * self.config.r_scale, self.config.min_r)
 
@@ -305,12 +339,24 @@ class AdaptiveKalmanFilter:
         else:
             raw_prices = df['close'].values
 
+        # Prepare high/low for Parkinson R (Risk Eye)
+        has_hl = 'high' in df.columns and 'low' in df.columns
+        if has_hl:
+            raw_high = df['high'].values
+            raw_low = df['low'].values
+        else:
+            raw_high = raw_prices.copy()
+            raw_low = raw_prices.copy()
+
         # Apply log transform for scale invariance
         if self.config.use_log_price:
-            # Handle non-positive prices gracefully
             prices = np.where(raw_prices > 0, np.log(raw_prices), np.nan)
+            log_high = np.where(raw_high > 0, np.log(raw_high), np.nan)
+            log_low = np.where(raw_low > 0, np.log(raw_low), np.nan)
         else:
             prices = raw_prices.copy()
+            log_high = raw_high.copy()
+            log_low = raw_low.copy()
 
         n = len(prices)
 
@@ -319,9 +365,11 @@ class AdaptiveKalmanFilter:
         trend_pred = np.full(n, np.nan)  # a priori state estimate
         velocity = np.full(n, np.nan)
         kalman_gain = np.full(n, np.nan)
-        uncertainty = np.full(n, np.nan)
+        uncertainty = np.full(n, np.nan)  # P (a posteriori)
+        uncertainty_pred = np.full(n, np.nan)  # P_pred (a priori) - for stop calculation
         innovation = np.full(n, np.nan)  # y = z - H*x_pred
-        innovation_cov = np.full(n, np.nan)  # S = H*P_pred*H^T + R
+        innovation_cov = np.full(n, np.nan)  # S_trend = H*P_pred*H^T + R_close (for update)
+        innovation_cov_risk = np.full(n, np.nan)  # S_risk = H*P_pred*H^T + R_parkinson (for stop)
 
         # Find first valid (non-NaN) price for initialization
         first_valid_idx = 0
@@ -370,6 +418,7 @@ class AdaptiveKalmanFilter:
                 velocity[i] = x[1]
                 kalman_gain[i] = 0.0  # No update happened
                 uncertainty[i] = P[0, 0]
+                uncertainty_pred[i] = P_pred[0, 0]
                 vel_history.append(x[1])
                 continue
 
@@ -394,22 +443,28 @@ class AdaptiveKalmanFilter:
             # P_pred = F * P * F^T + Q
             P_pred = self.F @ P @ self.F.T + Q_matrix
 
-            # === UPDATE STEP ===
-            # Estimate adaptive R
-            R_t = self._estimate_r(prices, i)
+            # === UPDATE STEP (Dual-Eye System) ===
+            # Eye 1: Trend Eye (Close-based R) - for smooth trend tracking
+            R_trend = self._estimate_r_close(prices, i)
+
+            # Eye 2: Risk Eye (Parkinson-based R) - for stop distance
+            R_risk = self._estimate_r_parkinson(log_high, log_low, i)
 
             # Innovation (measurement residual)
             y = z - (self.H @ x_pred)[0]
 
-            # Innovation covariance: S = H * P_pred * H^T + R
-            S = (self.H @ P_pred @ self.H.T)[0, 0] + R_t
+            # S_trend: for Kalman update (smooth tracking)
+            S_trend = (self.H @ P_pred @ self.H.T)[0, 0] + R_trend
 
-            # Compute and store NIS for adaptive Q adjustment
-            nis = self._compute_nis(y, S)
+            # S_risk: for stop distance (accounts for intrabar wicks)
+            S_risk = (self.H @ P_pred @ self.H.T)[0, 0] + R_risk
+
+            # Compute and store NIS for adaptive Q adjustment (using trend S)
+            nis = self._compute_nis(y, S_trend)
             nis_history.append(nis)
 
-            # Kalman Gain: K = P_pred * H^T * S^(-1)
-            K = (P_pred @ self.H.T) / S
+            # Kalman Gain: K = P_pred * H^T * S_trend^(-1)
+            K = (P_pred @ self.H.T) / S_trend
 
             # Update state: x = x_pred + K * y
             x = x_pred + K.flatten() * y
@@ -423,9 +478,11 @@ class AdaptiveKalmanFilter:
             trend[i] = x[0]
             velocity[i] = x[1]
             kalman_gain[i] = K[0, 0]
-            uncertainty[i] = P[0, 0]
+            uncertainty[i] = P[0, 0]  # P (a posteriori)
+            uncertainty_pred[i] = P_pred[0, 0]  # P_pred (a priori)
             innovation[i] = y  # Measurement residual
-            innovation_cov[i] = S  # Innovation covariance
+            innovation_cov[i] = S_trend  # S_trend = P_pred + R_close (for update)
+            innovation_cov_risk[i] = S_risk  # S_risk = P_pred + R_parkinson (for stop)
 
             vel_history.append(x[1])
 
@@ -450,10 +507,15 @@ class AdaptiveKalmanFilter:
         result['kf_deviation'] = deviation
         result['kf_deviation_pct'] = deviation_pct
         result['kf_gain'] = kalman_gain
-        result['kf_uncertainty'] = uncertainty
+        result['kf_uncertainty'] = uncertainty  # P (a posteriori)
+        result['kf_uncertainty_pred'] = uncertainty_pred  # P_pred (a priori)
+        result['kf_innovation_cov'] = innovation_cov  # S_trend = P_pred + R_close (for update)
+        result['kf_innovation_cov_risk'] = innovation_cov_risk  # S_risk = P_pred + R_parkinson (for stop!)
         result['kf_innovation'] = innovation  # Measurement residual (log space)
-        # Standardized Innovation: innovation / sqrt(S)
+        # Standardized Innovation: innovation / sqrt(S_trend)
         result['kf_std_innovation'] = innovation / (np.sqrt(innovation_cov) + 1e-10)
+        # Stop Distance (k=3): 3 * sqrt(S_risk) - ready to use!
+        result['kf_stop_distance'] = 3.0 * np.sqrt(innovation_cov_risk)
 
         # Normalized signal: deviation z-score
         signal_window = self.config.r_window
@@ -571,7 +633,11 @@ class KalmanFeatureGenerator:
             'kf_deviation',
             'kf_deviation_pct',
             'kf_gain',
-            'kf_uncertainty',
+            'kf_uncertainty',           # P (a posteriori)
+            'kf_uncertainty_pred',      # P_pred (a priori)
+            'kf_innovation_cov',        # S_trend = P_pred + R_close
+            'kf_innovation_cov_risk',   # S_risk = P_pred + R_parkinson (for stop!)
+            'kf_stop_distance',         # 3 * sqrt(S_risk) - ready to use!
             'kf_signal',
             'kf_std_innovation',
         ]
