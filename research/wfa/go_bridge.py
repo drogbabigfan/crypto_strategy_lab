@@ -20,6 +20,9 @@ import pyarrow.parquet as pq
 class BacktestConfig:
     """Configuration for Go backtester."""
 
+    # Exit mode: "tbm" (Triple Barrier), "signal" (opposite signal), "custom_stop" (per-bar stop prices)
+    exit_mode: str = "tbm"
+
     sl_mult: float = 2.0
     pt_mult: float = 2.5
     max_hold_bars: int = 100
@@ -30,12 +33,15 @@ class BacktestConfig:
     slippage_cap: float = 0.005
 
     initial_capital: float = 100000.0
-    risk_per_trade: float = 0.02
+    risk_per_trade: float = 1.0  # 1.0 = 100% capital, used with Size for leverage
+    max_leverage: float = 10.0  # Maximum allowed leverage
+    compounding: bool = True  # True for compound returns
 
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization (Go-compatible keys)."""
         # Go expects PascalCase keys
         return {
+            "ExitMode": self.exit_mode,
             "SLMult": self.sl_mult,
             "PTMult": self.pt_mult,
             "MaxHoldBars": self.max_hold_bars,
@@ -45,6 +51,8 @@ class BacktestConfig:
             "SlippageCap": self.slippage_cap,
             "InitialCapital": self.initial_capital,
             "RiskPerTrade": self.risk_per_trade,
+            "MaxLeverage": self.max_leverage,
+            "Compounding": self.compounding,
         }
 
 
@@ -124,6 +132,8 @@ class GoBridge:
         features_path: str,
         config: Optional[BacktestConfig] = None,
         timestamps: Optional[np.ndarray] = None,
+        sizes: Optional[np.ndarray] = None,
+        stop_prices: Optional[np.ndarray] = None,
         include_equity: bool = False,
     ) -> BacktestResult:
         """
@@ -134,6 +144,8 @@ class GoBridge:
             features_path: Path to features parquet file
             config: Backtest configuration
             timestamps: Optional timestamps for signals (uses indices if None)
+            sizes: Optional (N,) float64 array with position sizes (1.0 = 100%, 2.0 = 2x leverage)
+            stop_prices: Optional (N,) float64 array with per-bar stop prices (for custom_stop mode)
             include_equity: Whether to include equity curve in result
 
         Returns:
@@ -152,9 +164,9 @@ class GoBridge:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
 
-            # 1. Write signals to parquet
+            # 1. Write signals to parquet (with optional sizes and stop_prices)
             signals_path = tmpdir / "signals.parquet"
-            self._write_signals(signals, signals_path, timestamps)
+            self._write_signals(signals, signals_path, timestamps, sizes, stop_prices)
 
             # 2. Write config to JSON
             config_path = tmpdir / "config.json"
@@ -203,6 +215,8 @@ class GoBridge:
         features: np.ndarray,
         config: Optional[BacktestConfig] = None,
         timestamps: Optional[np.ndarray] = None,
+        sizes: Optional[np.ndarray] = None,
+        stop_prices: Optional[np.ndarray] = None,
         include_equity: bool = False,
     ) -> BacktestResult:
         """
@@ -213,6 +227,8 @@ class GoBridge:
             features: (N, 9) array with [timestamp, open, high, high_time, low, low_time, close, volume, realized_vol]
             config: Backtest configuration
             timestamps: Optional timestamps for signals
+            sizes: Optional (N,) float64 array with position sizes (1.0 = 100%, 2.0 = 2x leverage)
+            stop_prices: Optional (N,) float64 array with per-bar stop prices (for custom_stop mode)
             include_equity: Whether to include equity curve
 
         Returns:
@@ -236,6 +252,8 @@ class GoBridge:
                 features_path=str(features_path),
                 config=config,
                 timestamps=timestamps,
+                sizes=sizes,
+                stop_prices=stop_prices,
                 include_equity=include_equity,
             )
 
@@ -244,8 +262,10 @@ class GoBridge:
         signals: np.ndarray,
         path: Path,
         timestamps: Optional[np.ndarray] = None,
+        sizes: Optional[np.ndarray] = None,
+        stop_prices: Optional[np.ndarray] = None,
     ) -> None:
-        """Write signals to parquet format."""
+        """Write signals to parquet format with optional sizes and stop prices."""
         n = len(signals)
 
         if timestamps is None:
@@ -253,10 +273,27 @@ class GoBridge:
         else:
             timestamps = np.asarray(timestamps, dtype=np.int64)
 
-        table = pa.table({
+        # Build table columns
+        columns = {
             "timestamp": pa.array(timestamps, type=pa.int64()),
             "signal": pa.array(signals, type=pa.int8()),
-        })
+        }
+
+        # Add optional size column
+        if sizes is not None:
+            sizes = np.asarray(sizes, dtype=np.float64)
+            if len(sizes) != n:
+                raise ValueError(f"sizes length ({len(sizes)}) != signals length ({n})")
+            columns["size"] = pa.array(sizes, type=pa.float64())
+
+        # Add optional stop price column
+        if stop_prices is not None:
+            stop_prices = np.asarray(stop_prices, dtype=np.float64)
+            if len(stop_prices) != n:
+                raise ValueError(f"stop_prices length ({len(stop_prices)}) != signals length ({n})")
+            columns["sl_price"] = pa.array(stop_prices, type=pa.float64())
+
+        table = pa.table(columns)
         pq.write_table(table, path)
 
     def _write_features(self, features: np.ndarray, path: Path) -> None:

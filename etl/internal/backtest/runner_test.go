@@ -74,7 +74,7 @@ func TestRunWithData(t *testing.T) {
 	}
 
 	t.Run("empty data returns zero trades", func(t *testing.T) {
-		result := runner.RunWithData([]Bar{}, []Signal{})
+		result := runner.RunWithData([]Bar{}, []Signal{}, nil, nil)
 
 		if result.TotalTrades != 0 {
 			t.Errorf("Expected 0 trades, got %d", result.TotalTrades)
@@ -89,7 +89,7 @@ func TestRunWithData(t *testing.T) {
 			signals[i] = SignalNeutral
 		}
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		if result.TotalTrades != 0 {
 			t.Errorf("Expected 0 trades, got %d", result.TotalTrades)
@@ -115,7 +115,7 @@ func TestRunWithData(t *testing.T) {
 		signals := make([]Signal, len(bars))
 		signals[0] = SignalLong // Signal at bar 0, entry at bar 1
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		if result.TotalTrades != 1 {
 			t.Errorf("Expected 1 trade, got %d", result.TotalTrades)
@@ -141,7 +141,7 @@ func TestRunWithData(t *testing.T) {
 		signals := make([]Signal, len(bars))
 		signals[0] = SignalShort // Signal at bar 0, entry at bar 1
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		if result.TotalTrades != 1 {
 			t.Errorf("Expected 1 trade, got %d", result.TotalTrades)
@@ -159,7 +159,7 @@ func TestRunWithData(t *testing.T) {
 		signals[60] = SignalShort
 		signals[80] = SignalLong
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		if result.TotalTrades < 1 {
 			t.Error("Expected at least 1 trade")
@@ -171,7 +171,7 @@ func TestRunWithData(t *testing.T) {
 		signals := make([]Signal, len(bars))
 		signals[0] = SignalLong // Entry at bar 1, should force close at bar 9
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		// Should have closed the position
 		if result.TotalTrades != 1 {
@@ -184,7 +184,7 @@ func TestRunWithData(t *testing.T) {
 		signals := make([]Signal, len(bars))
 		signals[5] = SignalLong
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		if len(result.EquityCurve) != len(bars) {
 			t.Errorf("Equity curve length %d != bar count %d", len(result.EquityCurve), len(bars))
@@ -198,7 +198,7 @@ func TestRunWithData(t *testing.T) {
 		signals[5] = SignalLong
 		signals[30] = SignalShort
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		// Verify result fields are populated
 		if result.TotalTrades > 0 {
@@ -219,8 +219,8 @@ func TestRunWithDataConsistency(t *testing.T) {
 	signals[25] = SignalShort
 
 	// Run twice and verify same results
-	result1 := runner.RunWithData(bars, signals)
-	result2 := runner.RunWithData(bars, signals)
+	result1 := runner.RunWithData(bars, signals, nil, nil)
+	result2 := runner.RunWithData(bars, signals, nil, nil)
 
 	if result1.TotalTrades != result2.TotalTrades {
 		t.Error("Inconsistent TotalTrades between runs")
@@ -490,10 +490,10 @@ func TestRunnerReset(t *testing.T) {
 	signals[0] = SignalLong
 
 	// First run
-	result1 := runner.RunWithData(bars, signals)
+	result1 := runner.RunWithData(bars, signals, nil, nil)
 
 	// Second run should be independent
-	result2 := runner.RunWithData(bars, signals)
+	result2 := runner.RunWithData(bars, signals, nil, nil)
 
 	if result1.TotalTrades != result2.TotalTrades {
 		t.Error("Runner state not properly reset between runs")
@@ -516,7 +516,7 @@ func TestEdgeCases(t *testing.T) {
 		}}
 		signals := []Signal{SignalLong}
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		// Can't enter on single bar (need next bar)
 		if result.TotalTrades != 0 {
@@ -531,7 +531,7 @@ func TestEdgeCases(t *testing.T) {
 		}
 		signals := []Signal{SignalLong, SignalNeutral}
 
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 
 		// Should enter on bar 1, force close at bar 1 (end)
 		if result.TotalTrades != 1 {
@@ -545,7 +545,7 @@ func TestEdgeCases(t *testing.T) {
 		signals[0] = SignalLong
 
 		// Should not panic
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 		_ = result // Just check it doesn't crash
 	})
 
@@ -555,7 +555,7 @@ func TestEdgeCases(t *testing.T) {
 		signals[0] = SignalLong
 
 		// Should not panic - missing signals treated as neutral
-		result := runner.RunWithData(bars, signals)
+		result := runner.RunWithData(bars, signals, nil, nil)
 		_ = result
 	})
 }
@@ -597,7 +597,7 @@ func BenchmarkRunWithData_Small(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runner.RunWithData(bars, signals)
+		runner.RunWithData(bars, signals, nil, nil)
 	}
 }
 
@@ -613,7 +613,7 @@ func BenchmarkRunWithData_Large(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runner.RunWithData(bars, signals)
+		runner.RunWithData(bars, signals, nil, nil)
 	}
 }
 
@@ -634,6 +634,6 @@ func BenchmarkRunWithData_ManyTrades(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		runner.RunWithData(bars, signals)
+		runner.RunWithData(bars, signals, nil, nil)
 	}
 }

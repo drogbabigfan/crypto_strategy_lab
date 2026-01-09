@@ -40,6 +40,9 @@ const (
 	ExitModeTBM ExitMode = "tbm"
 	// ExitModeSignal exits on opposite signal (Long->Short or Short->Long)
 	ExitModeSignal ExitMode = "signal"
+	// ExitModeCustomStop uses per-bar stop prices from Python (trailing stop, MAE, etc.)
+	// Stop price is checked against bar's high/low for immediate exit at stop price
+	ExitModeCustomStop ExitMode = "custom_stop"
 )
 
 // Bar represents a single OHLCV bar with features.
@@ -138,8 +141,8 @@ func DefaultConfig() Config {
 // Validate checks if the configuration is valid.
 func (c Config) Validate() error {
 	// Validate exit mode
-	if c.ExitMode != ExitModeTBM && c.ExitMode != ExitModeSignal {
-		return fmt.Errorf("ExitMode must be 'tbm' or 'signal', got %q", c.ExitMode)
+	if c.ExitMode != ExitModeTBM && c.ExitMode != ExitModeSignal && c.ExitMode != ExitModeCustomStop {
+		return fmt.Errorf("ExitMode must be 'tbm', 'signal', or 'custom_stop', got %q", c.ExitMode)
 	}
 
 	// TBM mode requires barrier parameters
@@ -154,6 +157,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("MaxHoldBars must be positive, got %d", c.MaxHoldBars)
 		}
 	}
+	// CustomStop mode: no special validation needed, stop prices come from signal file
 
 	// Cost model parameters (always validated)
 	if c.BaseFee < 0 {

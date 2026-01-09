@@ -115,6 +115,9 @@ func (m *MetricsCalculator) Calculate(trades []Trade, bars []Bar) Result {
 // - Compounding (m.compounding=true): reinvest profits, each trade uses current capital
 // - Simple interest (m.compounding=false): fixed position size, additive returns
 // Uses trade.Size as a multiplier for position sizing (1.0 = 100%, 1.5 = 150%, etc.)
+//
+// IMPORTANT: Includes liquidation check - if equity drops to 0 or below, the account
+// is considered liquidated and equity stays at 0 for the rest of the backtest.
 func (m *MetricsCalculator) buildEquityCurve(trades []Trade, bars []Bar) []float64 {
 	numBars := len(bars)
 	if numBars == 0 {
@@ -123,6 +126,7 @@ func (m *MetricsCalculator) buildEquityCurve(trades []Trade, bars []Bar) []float
 
 	curve := make([]float64, numBars)
 	realizedCapital := m.initialCapital // Capital after all realized trades
+	liquidated := false                 // Track if account was liquidated
 
 	// For simple interest mode, use base position size
 	basePositionSize := m.initialCapital * m.riskPerTrade
@@ -131,6 +135,12 @@ func (m *MetricsCalculator) buildEquityCurve(trades []Trade, bars []Bar) []float
 	tradeIdx := 0
 
 	for barIdx := 0; barIdx < numBars; barIdx++ {
+		// If already liquidated, equity stays at 0
+		if liquidated {
+			curve[barIdx] = 0
+			continue
+		}
+
 		// Check if we've moved past the current trade's exit
 		for tradeIdx < len(trades) && trades[tradeIdx].ExitBar < barIdx {
 			// Apply realized P&L with trade's size
@@ -144,7 +154,19 @@ func (m *MetricsCalculator) buildEquityCurve(trades []Trade, bars []Bar) []float
 			} else {
 				realizedCapital += basePositionSize * trade.PnL * tradeSize
 			}
+
+			// Check for liquidation after realized P&L
+			if realizedCapital <= 0 {
+				liquidated = true
+				realizedCapital = 0
+				curve[barIdx] = 0
+				break
+			}
 			tradeIdx++
+		}
+
+		if liquidated {
+			continue
 		}
 
 		// Check if current bar is within an active trade
@@ -161,6 +183,12 @@ func (m *MetricsCalculator) buildEquityCurve(trades []Trade, bars []Bar) []float
 					realizedCapital *= (1 + trade.PnL*m.riskPerTrade*tradeSize)
 				} else {
 					realizedCapital += basePositionSize * trade.PnL * tradeSize
+				}
+
+				// Check for liquidation
+				if realizedCapital <= 0 {
+					liquidated = true
+					realizedCapital = 0
 				}
 				curve[barIdx] = realizedCapital
 				tradeIdx++
@@ -180,11 +208,21 @@ func (m *MetricsCalculator) buildEquityCurve(trades []Trade, bars []Bar) []float
 				}
 
 				// Apply unrealized P&L to equity (mark-to-market) with trade's size
+				var currentEquity float64
 				if m.compounding {
-					curve[barIdx] = realizedCapital * (1 + unrealizedPnL*m.riskPerTrade*tradeSize)
+					currentEquity = realizedCapital * (1 + unrealizedPnL*m.riskPerTrade*tradeSize)
 				} else {
-					curve[barIdx] = realizedCapital + basePositionSize*unrealizedPnL*tradeSize
+					currentEquity = realizedCapital + basePositionSize*unrealizedPnL*tradeSize
 				}
+
+				// Check for liquidation on unrealized loss
+				if currentEquity <= 0 {
+					liquidated = true
+					curve[barIdx] = 0
+					continue
+				}
+
+				curve[barIdx] = currentEquity
 				continue
 			}
 		}

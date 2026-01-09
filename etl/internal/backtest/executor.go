@@ -79,20 +79,32 @@ func (e *Executor) getAverageVolume() float64 {
 //  4. For reversal: if just exited and prevSignal is opposite, enter immediately
 //  5. Register new signal for next bar execution
 //  6. Store current signal for next bar's exit decision
-func (e *Executor) ProcessBar(barIdx int, bar Bar, signal Signal, size float64) *Trade {
+//
+// stopPrice: per-bar stop price from Python (used in custom_stop mode).
+// For Long: if bar.Low <= stopPrice, exit at stopPrice.
+// For Short: if bar.High >= stopPrice, exit at stopPrice.
+func (e *Executor) ProcessBar(barIdx int, bar Bar, signal Signal, size float64, stopPrice float64) *Trade {
 	// 1. Update volume window
 	e.updateAverageVolume(bar.Volume)
 
 	avgVolume := e.getAverageVolume()
 	var completedTrade *Trade
 
-	// 2. Check exit conditions using PREVIOUS bar's signal (next-bar exit)
-	// This prevents look-ahead bias: signal[i-1] decides exit at bar[i].Open
+	// 2. Check exit conditions
 	if e.position != nil {
-		if e.config.ExitMode == ExitModeSignal {
+		switch e.config.ExitMode {
+		case ExitModeSignal:
 			// Signal mode: exit on opposite/neutral signal from PREVIOUS bar
-			completedTrade = e.checkSignalExit(barIdx, bar, e.prevSignal, avgVolume)
-		} else {
+			completedTrade = e.checkSignalExit(barIdx, bar, e.prevSignal, avgVolume, 0)
+		case ExitModeCustomStop:
+			// Custom stop mode: use per-bar stop price from Python
+			// Stop is checked immediately on current bar's high/low
+			completedTrade = e.checkCustomStopExit(barIdx, bar, stopPrice, avgVolume)
+			// If no stop hit, also check for signal-based exit (Python provides exit price)
+			if completedTrade == nil {
+				completedTrade = e.checkSignalExit(barIdx, bar, e.prevSignal, avgVolume, stopPrice)
+			}
+		default:
 			// TBM mode: exit on TP/SL/Timeout (uses bar data, not signal)
 			completedTrade = e.checkExit(barIdx, bar, avgVolume)
 		}
@@ -106,12 +118,18 @@ func (e *Executor) ProcessBar(barIdx int, bar Bar, signal Signal, size float64) 
 
 	// 4. For reversal: if we just exited and prevSignal is an entry signal, enter immediately
 	// This allows exit and entry to happen at the same bar's Open (reversal)
+	// NOTE: Reversal is disabled in custom_stop mode because:
+	// - Python controls position via signals (0 = exit, no new entry)
+	// - Opposite signal in custom_stop mode means "exit only", not "reverse"
 	if completedTrade != nil && e.position == nil && e.prevSignal != SignalNeutral {
-		// We just exited and prevSignal indicates a new position
-		sig := e.prevSignal
-		e.pendingSignal = nil // Clear any pending
-		// Execute entry immediately at same bar's Open (use prev size for reversal)
-		e.executeEntryWithSignal(barIdx, bar, avgVolume, sig, e.prevSize)
+		// Skip reversal in custom_stop mode
+		if e.config.ExitMode != ExitModeCustomStop {
+			// We just exited and prevSignal indicates a new position
+			sig := e.prevSignal
+			e.pendingSignal = nil // Clear any pending
+			// Execute entry immediately at same bar's Open (use prev size for reversal)
+			e.executeEntryWithSignal(barIdx, bar, avgVolume, sig, e.prevSize)
+		}
 	}
 
 	// 5. Register new signal for next bar execution (only if flat and no reversal happened)
@@ -129,19 +147,29 @@ func (e *Executor) ProcessBar(barIdx int, bar Bar, signal Signal, size float64) 
 	return completedTrade
 }
 
-// checkSignalExit checks if position should be closed due to opposite or neutral signal.
-// In signal mode: Long closes on Short/Neutral signal, Short closes on Long/Neutral signal.
-func (e *Executor) checkSignalExit(barIdx int, bar Bar, signal Signal, avgVolume float64) *Trade {
+// checkSignalExit checks if position should be closed due to signal change.
+// In signal mode: Long closes on Short signal, Short closes on Long signal.
+// Neutral signal does NOT trigger exit - it means "hold current position".
+// In custom_stop mode: also exit on neutral signal (matches Python behavior).
+// exitPriceHint: if > 0, use this as exit price instead of bar.Open (for Python-calculated exits).
+func (e *Executor) checkSignalExit(barIdx int, bar Bar, signal Signal, avgVolume float64, exitPriceHint float64) *Trade {
 	pos := e.position
 	if pos == nil {
 		return nil
 	}
 
-	// Check for opposite or neutral signal
 	shouldExit := false
-	if pos.Direction == DirectionLong && (signal == SignalShort || signal == SignalNeutral) {
+
+	// Check for opposite signal (all modes)
+	if pos.Direction == DirectionLong && signal == SignalShort {
 		shouldExit = true
-	} else if pos.Direction == DirectionShort && (signal == SignalLong || signal == SignalNeutral) {
+	} else if pos.Direction == DirectionShort && signal == SignalLong {
+		shouldExit = true
+	}
+
+	// In custom_stop mode, also exit on neutral signal
+	// This matches Python backtester behavior where signal=0 means "exit position"
+	if e.config.ExitMode == ExitModeCustomStop && signal == SignalNeutral {
 		shouldExit = true
 	}
 
@@ -149,8 +177,11 @@ func (e *Executor) checkSignalExit(barIdx int, bar Bar, signal Signal, avgVolume
 		return nil
 	}
 
-	// Exit at this bar's Open (signal was generated at previous bar)
+	// Exit price: use hint if provided, otherwise bar.Open
 	exitPrice := bar.Open
+	if exitPriceHint > 0 && exitPriceHint < 1e17 { // Valid exit price from Python
+		exitPrice = exitPriceHint
+	}
 	holdingBars := barIdx - pos.EntryBar
 
 	// Apply exit slippage
@@ -372,6 +403,66 @@ func (e *Executor) GetPosition() *Position {
 // HasPendingSignal returns true if there's a signal waiting for execution.
 func (e *Executor) HasPendingSignal() bool {
 	return e.pendingSignal != nil
+}
+
+// checkCustomStopExit checks if position should be closed due to custom stop price.
+// Uses bar's high/low to determine if stop was hit, exits at stop price (not next bar open).
+// This enables precise stop execution for trailing stops, MAE stops, etc.
+func (e *Executor) checkCustomStopExit(barIdx int, bar Bar, stopPrice float64, avgVolume float64) *Trade {
+	pos := e.position
+	if pos == nil || stopPrice <= 0 {
+		return nil
+	}
+
+	var slHit bool
+	var exitPrice float64
+
+	if pos.Direction == DirectionLong {
+		// Long position: stop hit if low reaches stop price
+		slHit = bar.Low <= stopPrice
+		exitPrice = stopPrice
+	} else {
+		// Short position: stop hit if high reaches stop price
+		slHit = bar.High >= stopPrice
+		exitPrice = stopPrice
+	}
+
+	if !slHit {
+		return nil
+	}
+
+	holdingBars := barIdx - pos.EntryBar
+
+	// Apply exit slippage to stop price
+	actualExitPrice := e.costModel.ApplyExitSlippage(
+		exitPrice,
+		pos.Direction,
+		bar.RealizedVol,
+		e.config.RiskPerTrade,
+		avgVolume,
+	)
+
+	// Calculate P&L
+	grossPnL, netPnL := e.costModel.CalculatePnL(pos.EntryPrice, actualExitPrice, pos.Direction)
+
+	trade := &Trade{
+		EntryBar:    pos.EntryBar,
+		ExitBar:     barIdx,
+		Direction:   pos.Direction,
+		EntryPrice:  pos.EntryPrice,
+		ExitPrice:   actualExitPrice,
+		GrossPnL:    grossPnL,
+		PnL:         netPnL,
+		TotalCost:   grossPnL - netPnL,
+		ExitReason:  ExitReasonSL, // Custom stop is treated as SL
+		HoldingBars: holdingBars,
+		Size:        pos.Size,
+	}
+
+	// Close position
+	e.position = nil
+
+	return trade
 }
 
 // ForceClose closes the current position at the given price.

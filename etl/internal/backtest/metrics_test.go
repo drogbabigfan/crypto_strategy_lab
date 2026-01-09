@@ -746,3 +746,226 @@ func BenchmarkCalculateMetrics(b *testing.B) {
 		mc.Calculate(trades, bars)
 	}
 }
+
+// ============================================================
+// Liquidation Tests
+// ============================================================
+
+func TestLiquidationOnRealizedLoss(t *testing.T) {
+	// Test that equity goes to 0 and stays there after liquidation
+	// Using high leverage (riskPerTrade = 1.0) and big loss
+	mc := NewMetricsCalculator(10000, 1.0, true) // Full position sizing, compounding
+
+	// Create a trade with 100% loss (ruin scenario with leverage)
+	// PnL = -1.0 means 100% loss on the position
+	trades := []Trade{
+		{
+			PnL:        -1.0, // Complete loss
+			EntryBar:   5,
+			ExitBar:    10,
+			HoldingBars: 5,
+			ExitReason: ExitReasonSL,
+			Direction:  DirectionLong,
+			EntryPrice: 50000,
+			Size:       1.0,
+		},
+	}
+
+	bars := makeTestBars(20, 50000)
+	result := mc.Calculate(trades, bars)
+
+	// After trade exit at bar 10, equity should be 0
+	for i := 10; i < len(result.EquityCurve); i++ {
+		if result.EquityCurve[i] != 0 {
+			t.Errorf("EquityCurve[%d] = %f, want 0 after liquidation", i, result.EquityCurve[i])
+		}
+	}
+
+	// Max drawdown should be 100%
+	if math.Abs(result.MaxDrawdown-1.0) > 0.01 {
+		t.Errorf("MaxDrawdown = %f, want 1.0 (100%%)", result.MaxDrawdown)
+	}
+}
+
+func TestLiquidationOnUnrealizedLoss(t *testing.T) {
+	// Test liquidation during mark-to-market (unrealized loss)
+	mc := NewMetricsCalculator(10000, 1.0, true) // Full position, compounding
+
+	// Create a trade that causes unrealized liquidation before exit
+	// The trade itself isn't a total loss, but during the position
+	// the mark-to-market shows 100%+ loss
+	trades := []Trade{
+		{
+			PnL:        -0.5, // 50% loss on exit
+			EntryBar:   5,
+			ExitBar:    15,
+			HoldingBars: 10,
+			ExitReason: ExitReasonSL,
+			Direction:  DirectionLong,
+			EntryPrice: 100,
+			Size:       1.0,
+		},
+	}
+
+	// Create bars where price drops dramatically during the trade
+	bars := make([]Bar, 20)
+	for i := range bars {
+		price := 100.0
+		if i >= 5 && i < 15 {
+			// During trade, price crashes
+			// At entry (bar 5): price = 100
+			// We need unrealized loss > 100% to trigger liquidation
+			// For long: unrealized = (current - entry) / entry
+			// If current = -10, unrealized = (-10 - 100) / 100 = -1.1 = -110%
+			price = 100 - float64(i-5)*20 // Drops by 20 each bar
+		}
+		bars[i] = Bar{
+			Timestamp: int64(i * 60000),
+			Open:      price,
+			High:      price * 1.01,
+			Low:       price * 0.99,
+			Close:     price,
+			Volume:    1000,
+		}
+	}
+
+	result := mc.Calculate(trades, bars)
+
+	// Somewhere during the trade, equity should hit 0 due to unrealized loss
+	foundZero := false
+	for i := 5; i < 15; i++ {
+		if result.EquityCurve[i] == 0 {
+			foundZero = true
+			break
+		}
+	}
+
+	if !foundZero {
+		t.Log("EquityCurve during trade:")
+		for i := 5; i < 15; i++ {
+			t.Logf("  Bar %d: equity=%f", i, result.EquityCurve[i])
+		}
+		t.Error("Expected liquidation (equity=0) during unrealized loss period")
+	}
+}
+
+func TestNoLiquidationOnSmallLoss(t *testing.T) {
+	// Normal trading without liquidation
+	mc := NewMetricsCalculator(10000, 0.1, false) // 10% position sizing, simple
+
+	trades := []Trade{
+		{PnL: -0.1, EntryBar: 5, ExitBar: 10, Direction: DirectionLong, EntryPrice: 100, Size: 1.0},
+		{PnL: 0.2, EntryBar: 15, ExitBar: 20, Direction: DirectionLong, EntryPrice: 100, Size: 1.0},
+	}
+
+	bars := makeTestBars(30, 100)
+	result := mc.Calculate(trades, bars)
+
+	// No equity should be 0
+	for i, eq := range result.EquityCurve {
+		if eq == 0 {
+			t.Errorf("EquityCurve[%d] = 0, but should not be liquidated with small losses", i)
+		}
+	}
+
+	// Final equity should be positive
+	finalEquity := result.EquityCurve[len(result.EquityCurve)-1]
+	if finalEquity <= 0 {
+		t.Errorf("Final equity = %f, want positive", finalEquity)
+	}
+}
+
+func TestLiquidationStaysAtZero(t *testing.T) {
+	// After liquidation, equity should stay at 0 even with subsequent "trades"
+	mc := NewMetricsCalculator(10000, 1.0, true)
+
+	trades := []Trade{
+		{
+			PnL:        -1.0, // Liquidation
+			EntryBar:   5,
+			ExitBar:    10,
+			Direction:  DirectionLong,
+			EntryPrice: 100,
+			Size:       1.0,
+		},
+		{
+			PnL:        0.5, // This trade shouldn't matter - already liquidated
+			EntryBar:   15,
+			ExitBar:    20,
+			Direction:  DirectionLong,
+			EntryPrice: 100,
+			Size:       1.0,
+		},
+	}
+
+	bars := makeTestBars(30, 100)
+	result := mc.Calculate(trades, bars)
+
+	// All bars after liquidation should be 0
+	for i := 10; i < len(result.EquityCurve); i++ {
+		if result.EquityCurve[i] != 0 {
+			t.Errorf("EquityCurve[%d] = %f, want 0 (should stay liquidated)", i, result.EquityCurve[i])
+		}
+	}
+}
+
+func TestLiquidationWithLeverage(t *testing.T) {
+	// Test liquidation with leveraged position (Size > 1)
+	mc := NewMetricsCalculator(10000, 0.1, true) // 10% base, but size = 10 = 100% effective
+
+	trades := []Trade{
+		{
+			PnL:        -0.1, // 10% loss, but with 10x size = 100% loss
+			EntryBar:   5,
+			ExitBar:    10,
+			Direction:  DirectionLong,
+			EntryPrice: 100,
+			Size:       10.0, // 10x leverage
+		},
+	}
+
+	bars := makeTestBars(20, 100)
+	result := mc.Calculate(trades, bars)
+
+	// With compounding: capital *= (1 + PnL * riskPerTrade * size)
+	// = 10000 * (1 + (-0.1) * 0.1 * 10) = 10000 * (1 - 0.1) = 9000
+	// Wait, that's not liquidation. Let me recalculate.
+	// Actually: 1 + (-0.1) * 0.1 * 10 = 1 - 0.1 = 0.9
+	// So capital = 10000 * 0.9 = 9000, not liquidated.
+	//
+	// For liquidation: 1 + PnL * riskPerTrade * size <= 0
+	// PnL * riskPerTrade * size <= -1
+	// With riskPerTrade=0.1, size=10: PnL <= -1
+	// So need PnL = -1 for liquidation
+
+	// Actually this test case won't trigger liquidation with current params
+	// Let me verify the final equity is 9000 (not liquidated)
+	finalEquity := result.EquityCurve[len(result.EquityCurve)-1]
+	expectedEquity := 10000.0 * (1 + (-0.1)*0.1*10.0) // = 9000
+
+	if math.Abs(finalEquity-expectedEquity) > 0.01 {
+		t.Errorf("Final equity = %f, want %f", finalEquity, expectedEquity)
+	}
+
+	// Now test with actual liquidation scenario
+	mc2 := NewMetricsCalculator(10000, 0.1, true)
+	trades2 := []Trade{
+		{
+			PnL:        -1.0, // 100% loss with leverage = liquidation
+			EntryBar:   5,
+			ExitBar:    10,
+			Direction:  DirectionLong,
+			EntryPrice: 100,
+			Size:       10.0,
+		},
+	}
+
+	result2 := mc2.Calculate(trades2, bars)
+
+	// After this: capital *= (1 + (-1.0) * 0.1 * 10) = capital * 0 = 0
+	for i := 10; i < len(result2.EquityCurve); i++ {
+		if result2.EquityCurve[i] != 0 {
+			t.Errorf("EquityCurve[%d] = %f, want 0 (liquidated with leverage)", i, result2.EquityCurve[i])
+		}
+	}
+}

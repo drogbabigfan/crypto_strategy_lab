@@ -54,8 +54,8 @@ type FeatureRecord struct {
 
 // Run executes the backtest with data from files.
 func (r *Runner) Run(signalsPath, featuresPath string) (Result, error) {
-	// Load signals and sizes
-	signals, sizes, err := r.loadSignals(signalsPath)
+	// Load signals, sizes, and stop prices
+	signals, sizes, stopPrices, err := r.loadSignals(signalsPath)
 	if err != nil {
 		return Result{}, fmt.Errorf("failed to load signals: %w", err)
 	}
@@ -72,12 +72,14 @@ func (r *Runner) Run(signalsPath, featuresPath string) (Result, error) {
 	}
 
 	// Run simulation
-	return r.RunWithData(bars, signals, sizes), nil
+	return r.RunWithData(bars, signals, sizes, stopPrices), nil
 }
 
 // RunWithData executes the backtest with in-memory data.
 // sizes is optional - if nil or empty, all positions use size 1.0.
-func (r *Runner) RunWithData(bars []Bar, signals []Signal, sizes []float64) Result {
+// stopPrices is optional - if nil or empty, uses TBM or signal-based exits.
+// When stopPrices is provided and ExitMode is "custom_stop", uses per-bar stop prices.
+func (r *Runner) RunWithData(bars []Bar, signals []Signal, sizes []float64, stopPrices []float64) Result {
 	r.executor.Reset()
 
 	trades := make([]Trade, 0)
@@ -97,7 +99,13 @@ func (r *Runner) RunWithData(bars []Bar, signals []Signal, sizes []float64) Resu
 			size = sizes[i]
 		}
 
-		trade := r.executor.ProcessBar(i, bars[i], signal, size)
+		// Get stop price for this bar (0 means no custom stop)
+		stopPrice := 0.0
+		if stopPrices != nil && i < len(stopPrices) {
+			stopPrice = stopPrices[i]
+		}
+
+		trade := r.executor.ProcessBar(i, bars[i], signal, size, stopPrice)
 		if trade != nil {
 			trades = append(trades, *trade)
 			cumulativePnL += trade.PnL * trade.Size // Weighted by size
@@ -135,12 +143,12 @@ func (r *Runner) RunWithData(bars []Bar, signals []Signal, sizes []float64) Resu
 	return r.metrics.Calculate(trades, barsToUse)
 }
 
-// loadSignals reads signals and sizes from a parquet file.
-// Returns signals, sizes (nil if not present in file), and error.
-func (r *Runner) loadSignals(path string) ([]Signal, []float64, error) {
+// loadSignals reads signals, sizes, and stop prices from a parquet file.
+// Returns signals, sizes (nil if not present), stopPrices (nil if not present), and error.
+func (r *Runner) loadSignals(path string) ([]Signal, []float64, []float64, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer file.Close()
 
@@ -149,7 +157,9 @@ func (r *Runner) loadSignals(path string) ([]Signal, []float64, error) {
 
 	signals := make([]Signal, 0, reader.NumRows())
 	sizes := make([]float64, 0, reader.NumRows())
+	stopPrices := make([]float64, 0, reader.NumRows())
 	hasSizes := false
+	hasStopPrices := false
 
 	for {
 		var record SignalRecord
@@ -164,21 +174,33 @@ func (r *Runner) loadSignals(path string) ([]Signal, []float64, error) {
 			hasSizes = true
 		}
 		sizes = append(sizes, record.Size)
+
+		// Check if stop price column is present (non-zero value indicates it's set)
+		if record.SLPrice > 0 {
+			hasStopPrices = true
+		}
+		stopPrices = append(stopPrices, record.SLPrice)
 	}
 
 	// If no sizes were set, return nil to indicate default sizing
-	if !hasSizes {
-		return signals, nil, nil
-	}
-
-	// Replace 0 sizes with 1.0 (default)
-	for i := range sizes {
-		if sizes[i] <= 0 {
-			sizes[i] = 1.0
+	var finalSizes []float64
+	if hasSizes {
+		finalSizes = sizes
+		// Replace 0 sizes with 1.0 (default)
+		for i := range finalSizes {
+			if finalSizes[i] <= 0 {
+				finalSizes[i] = 1.0
+			}
 		}
 	}
 
-	return signals, sizes, nil
+	// If no stop prices were set, return nil
+	var finalStopPrices []float64
+	if hasStopPrices {
+		finalStopPrices = stopPrices
+	}
+
+	return signals, finalSizes, finalStopPrices, nil
 }
 
 // loadFeatures reads bars/features from a parquet file.
