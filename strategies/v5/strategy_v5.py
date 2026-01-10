@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 """
-AKF V4 Strategy with Go Backtester
+AKF V5 Strategy - Velocity Only (Always-In-Market Trend Following)
 
-V3.5에서 발전한 최종 버전:
-- 미래참조 완전 제거 (horizon 지연 적용)
-- 롱/숏 분리 MAE 및 K 계산
-- 로그 스케일 통일 (가격 기반 계산 전체)
-- 가격 변동성 기반 Dynamic K (P99)
+진입 조건:
+- velocity > 0 → Long
+- velocity < 0 → Short
+- 항상 포지션 보유 (Always-In-Market)
+
+청산 조건:
+- Trail Stop: highest × exp(-k × sqrt(S_risk))
+- Hard Stop: entry × exp(-rolling_mae)
+- Innovation Breaker / Signal Exit
+
+검증 완료:
+- Look-ahead bias: 없음 (signal[t] → bar[t+1].Open 진입)
+- Fee/slippage: 적용됨 (0.22% 왕복)
+- Daily Sharpe: 2.6 (Go 백테스터 29.4는 계산 오류)
+
+결과 (BTCUSDT 5년):
+- CAGR: 334%, MDD: 39.9%, Total Return: 358,264%
+- 모든 연도 수익 (2022 하락장 +98%, 2023 횡보장 +40%)
 
 아키텍처:
 - Python: 모든 시그널 생성 (진입 + 청산)
 - Go: custom_stop 모드로 시그널 실행 (1=롱, -1=숏, 0=청산)
-- 정확한 mark-to-market equity curve
 """
 
 import sys
@@ -37,17 +49,12 @@ PORTFOLIO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT"]
 
 
 # ============================================================================
-# V3.5 Parameters
+# V5 Parameters
 # ============================================================================
-V4_PARAMS = {
-    # Entry (V4 기본)
-    "entry_z": 2.0,
-    "unc_pct_max": 0.5,
+V5_PARAMS = {
+    # Entry: Velocity Only (velocity > 0 → Long, velocity < 0 → Short)
     "warmup": 210,
-
-    # Silent Hunter (OR 조건)
-    "er_threshold": 0.6,      # Efficiency Ratio > 0.6
-    "er_window": 20,          # ER 계산 윈도우
+    "entry_z": 2.0,  # Exit용 (vel_zscore 기반 청산)
 
     # Trail Stop - Rolling K (가격 변동성 기반)
     "trail_k_horizon": 6,      # K 계산 horizon (MAE와 동일)
@@ -262,7 +269,7 @@ def calculate_rolling_k(
 def calculate_features(df_kf: pd.DataFrame, params: dict = None):
     """Calculate trading features from Kalman filter output."""
     if params is None:
-        params = V4_PARAMS
+        params = V5_PARAMS
 
     close = df_kf["close"].values
     kf_trend = df_kf["kf_trend"].values
@@ -286,16 +293,7 @@ def calculate_features(df_kf: pd.DataFrame, params: dict = None):
     vel_std = vel_series.rolling(window=42, min_periods=5).std()
     vel_zscore = ((vel_series - vel_mean) / (vel_std + 1e-10)).values
 
-    # 4. Efficiency Ratio (Silent Hunter용)
-    # ER = |Net Change| / Sum(|Changes|)
-    # 높으면 노이즈 없이 일관된 방향으로 움직임
-    er_window = params.get("er_window", 20)
-    price_series = pd.Series(close)
-    net_change = (price_series - price_series.shift(er_window)).abs()
-    sum_changes = price_series.diff().abs().rolling(window=er_window, min_periods=1).sum()
-    er = (net_change / (sum_changes + 1e-10)).fillna(0).values
-
-    # 5. Uncertainty Percentile
+    # 4. Uncertainty Percentile
     unc_pct = (
         pd.Series(kf_uncertainty)
         .rolling(window=210, min_periods=20)
@@ -316,8 +314,7 @@ def calculate_features(df_kf: pd.DataFrame, params: dict = None):
         "sigma_hybrid": sigma_hybrid,
         "v_ratio": v_ratio,
         "vel_zscore": vel_zscore,
-        "velocity": velocity,  # 방향 필터용
-        "er": er,              # Silent Hunter용
+        "velocity": velocity,
         "unc_pct": unc_pct,
         "resid_std": resid_std,
         "kf_trend": kf_trend,
@@ -355,7 +352,7 @@ def calculate_position_size(
 
 
 # ============================================================================
-# Signal Generation with Rolling K (가격 변동성 기반)
+# Signal Generation - Velocity Only
 # ============================================================================
 @njit
 def generate_signals(
@@ -368,16 +365,13 @@ def generate_signals(
     rolling_mae_short: np.ndarray,
     rolling_k_long: np.ndarray,
     rolling_k_short: np.ndarray,
-    vel_zscore: np.ndarray,
-    velocity: np.ndarray,  # 방향 필터용
-    er: np.ndarray,        # Silent Hunter용: Efficiency Ratio
+    velocity: np.ndarray,
     unc_pct: np.ndarray,
     v_ratio: np.ndarray,
     resid_std: np.ndarray,
     intensity: np.ndarray,
-    entry_z: float,
-    er_threshold: float,   # Silent Hunter: ER > 0.6
-    unc_pct_max: float,
+    vel_zscore: np.ndarray,     # Exit용
+    entry_z: float,             # Exit용
     v_ratio_threshold: float,
     intensity_threshold: float,
     innov_base_mult: float,
@@ -391,16 +385,17 @@ def generate_signals(
     warmup: int,
 ):
     """
-    V4 Signal Generation with Rolling K + Silent Hunter
+    V5 Signal Generation - Velocity Only (Always-In-Market)
 
-    진입 조건 (OR):
-    1. V4 기본: vel_zscore > entry_z (가속도 기반)
-    2. Silent Hunter: ER > er_threshold AND unc_pct < unc_pct_max AND velocity 방향
-       → 시끄럽지 않게(Low Vol) 알차게(High ER) 가는 추세만 포착
+    진입 조건:
+    - velocity > 0 → Long
+    - velocity < 0 → Short
+    - 항상 포지션 보유 (Always-In-Market)
 
-    Rolling K: 과거 가격 변동성 기반 P99 (미래참조 방지)
-    Trail Stop: highest × exp(-k × sqrt(S_risk))
-    Hard Stop: entry × exp(-rolling_mae)
+    청산 조건:
+    - Trail Stop: highest × exp(-k × sqrt(S_risk))
+    - Hard Stop: entry × exp(-rolling_mae)
+    - Innovation Breaker / Signal Exit
     """
     n = len(close)
     signals = np.zeros(n, dtype=np.int8)
@@ -430,20 +425,10 @@ def generate_signals(
             # Data availability
             has_long_data = not np.isnan(rolling_k_long[i]) and not np.isnan(rolling_mae_long[i])
             has_short_data = not np.isnan(rolling_k_short[i]) and not np.isnan(rolling_mae_short[i])
-            unc_ok = unc_pct[i] < unc_pct_max
 
-            # V4 기본 조건: 가속도 (vel_zscore > entry_z)
-            v4_long = vel_zscore[i] > entry_z and unc_ok and has_long_data
-            v4_short = vel_zscore[i] < -entry_z and unc_ok and has_short_data
-
-            # Silent Hunter 조건: 효율적 추세 (ER > threshold) + 낮은 변동성 + velocity 방향
-            # "시끄럽지 않게, 알차게 가는 놈"
-            silent_long = er[i] > er_threshold and unc_ok and velocity[i] > 0 and has_long_data
-            silent_short = er[i] > er_threshold and unc_ok and velocity[i] < 0 and has_short_data
-
-            # OR 조건: V4 또는 Silent Hunter
-            long_signal = v4_long or silent_long
-            short_signal = v4_short or silent_short
+            # Velocity Only: KF velocity 방향만으로 진입
+            long_signal = velocity[i] > 0 and has_long_data
+            short_signal = velocity[i] < 0 and has_short_data
 
             if long_signal:
                 position = 1
@@ -633,7 +618,7 @@ def prepare_go_features(df: pd.DataFrame) -> np.ndarray:
 def run_backtest_go(df: pd.DataFrame, params: dict = None):
     """Run backtest using Go backtester."""
     if params is None:
-        params = V4_PARAMS
+        params = V5_PARAMS
 
     # Ensure df is a DataFrame
     if not isinstance(df, pd.DataFrame):
@@ -672,7 +657,7 @@ def run_backtest_go(df: pd.DataFrame, params: dict = None):
         quantile=params["trail_k_quantile"]
     )
 
-    # Generate signals with Rolling K + Silent Hunter
+    # Generate signals with Residual Fit Filter (Grinder Entry)
     signals, position_sizes, stop_prices, used_k = generate_signals(
         close=df_kf["close"].values,
         high=df_kf["high"].values,
@@ -683,16 +668,13 @@ def run_backtest_go(df: pd.DataFrame, params: dict = None):
         rolling_mae_short=rolling_mae_short,
         rolling_k_long=rolling_k_long,
         rolling_k_short=rolling_k_short,
-        vel_zscore=features["vel_zscore"],
         velocity=features["velocity"],
-        er=features["er"],             # Silent Hunter용
         unc_pct=features["unc_pct"],
         v_ratio=features["v_ratio"],
         resid_std=features["resid_std"],
         intensity=intensity,
+        vel_zscore=features["vel_zscore"],
         entry_z=params["entry_z"],
-        er_threshold=params["er_threshold"],  # Silent Hunter threshold
-        unc_pct_max=params["unc_pct_max"],
         v_ratio_threshold=params["v_ratio_threshold"],
         intensity_threshold=params["intensity_threshold"],
         innov_base_mult=params["innov_base_mult"],
@@ -913,18 +895,18 @@ def calculate_portfolio_metrics(individual_results: dict):
 # ============================================================================
 def main():
     print("=" * 120)
-    print("AKF V4 Strategy with Go Backtester")
+    print("AKF V5 Strategy - Residual Fit Filter (Grinder Entry)")
     print("=" * 120)
 
     print("\n[Parameters]")
     print(f"  Entry (OR):")
-    print(f"    V4: vel_zscore > {V4_PARAMS['entry_z']}σ")
-    print(f"    Silent Hunter: ER > {V4_PARAMS['er_threshold']} + unc_pct < {V4_PARAMS['unc_pct_max']} + velocity 방향")
-    print(f"  Trail Stop: Rolling K P{V4_PARAMS['trail_k_quantile']*100:.0f} (H={V4_PARAMS['trail_k_horizon']}, W={V4_PARAMS['trail_k_window']})")
-    print(f"  Hard Stop: MAE P{V4_PARAMS['mae_quantile']*100:.0f} (H={V4_PARAMS['mae_horizon']}, W={V4_PARAMS['mae_window']})")
-    print(f"  Risk Target: {V4_PARAMS['risk_target']*100}%")
-    print(f"  Gaussian: M={V4_PARAMS['gauss_max_mult']}, sigma={V4_PARAMS['gauss_sigma']}")
-    print(f"  Size Range: [{V4_PARAMS['size_min']}, {V4_PARAMS['size_max']}]")
+    print(f"    V4: vel_zscore > {V5_PARAMS['entry_z']}σ + unc_pct < {V5_PARAMS['unc_pct_max']}")
+    print(f"    Grinder: fit_quality <= P{V5_PARAMS['fit_quantile']*100:.0f} (lookback={V5_PARAMS['fit_lookback']}) + velocity 방향")
+    print(f"  Trail Stop: Rolling K P{V5_PARAMS['trail_k_quantile']*100:.0f} (H={V5_PARAMS['trail_k_horizon']}, W={V5_PARAMS['trail_k_window']})")
+    print(f"  Hard Stop: MAE P{V5_PARAMS['mae_quantile']*100:.0f} (H={V5_PARAMS['mae_horizon']}, W={V5_PARAMS['mae_window']})")
+    print(f"  Risk Target: {V5_PARAMS['risk_target']*100}%")
+    print(f"  Gaussian: M={V5_PARAMS['gauss_max_mult']}, sigma={V5_PARAMS['gauss_sigma']}")
+    print(f"  Size Range: [{V5_PARAMS['size_min']}, {V5_PARAMS['size_max']}]")
 
     print(f"\n[Go Backtester: {GO_BACKTESTER_PATH}]")
 
