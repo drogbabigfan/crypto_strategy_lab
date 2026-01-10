@@ -743,7 +743,7 @@ func setupGeneratorSkipWarmup(threshold float64) *Generator {
 	g := NewGenerator()
 
 	// Set up to skip warmup
-	avgDailyVolume := threshold * float64(TargetBarsPerDay)
+	avgDailyVolume := threshold * float64(DefaultTargetBarsPerDay)
 	for i := 0; i < WarmupDays; i++ {
 		g.dailyVolumes[i] = avgDailyVolume
 	}

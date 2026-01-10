@@ -517,7 +517,7 @@ func TestBarCountConsistency(t *testing.T) {
 
 	// Get threshold after warmup
 	threshold := g.GetCurrentThreshold()
-	expectedThreshold := dailyVolume / float64(TargetBarsPerDay) // $10B / 50 = $200M
+	expectedThreshold := dailyVolume / float64(DefaultTargetBarsPerDay) // $10B / 50 = $200M
 
 	if threshold <= 0 {
 		t.Fatalf("Threshold should be positive, got %f", threshold)

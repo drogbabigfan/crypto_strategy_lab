@@ -63,7 +63,7 @@ V4_PARAMS = {
 
     # Dynamic Sizing (Gaussian)
     "risk_target": 0.03,        # 3%
-    "gauss_max_mult": 2.0,      # 최대 배율
+    "gauss_max_mult": 4.0,      # 최대 배율
     "gauss_sigma": 0.5,         # Gaussian sigma
     "size_min": 0.1,
     "size_max": 3.0,
@@ -149,8 +149,10 @@ def calculate_rolling_mae(
 
     for t in range(min_start, n):
         # t-horizon-1 까지의 MAE만 사용 (미래참조 방지)
-        start_idx = t - window - horizon - 1
-        end_idx = t - horizon - 1
+        # mae[t-horizon-1]은 prices[t-horizon:t]를 사용 → t-1까지만 참조 (OK)
+        # Python 슬라이싱 [start:end]는 end를 포함하지 않으므로 end_idx = t - horizon
+        start_idx = t - window - horizon
+        end_idx = t - horizon  # 슬라이싱이 t-horizon-1까지 포함
         if start_idx < 0:
             start_idx = 0
 
@@ -225,12 +227,14 @@ def calculate_rolling_k(
     rolling_k_long = np.full(n, np.nan)
     rolling_k_short = np.full(n, np.nan)
 
-    # 미래참조 방지
+    # 미래참조 방지: k[t-horizon-1]까지만 사용
+    # k[t-horizon-1]은 prices[t-horizon:t]를 사용 → t-1까지만 참조 (OK)
     min_start = window + horizon + 1
 
     for t in range(min_start, n):
-        start_idx = t - window - horizon - 1
-        end_idx = t - horizon - 1
+        # Python 슬라이싱 [start:end]는 end를 포함하지 않으므로 end_idx = t - horizon
+        start_idx = t - window - horizon
+        end_idx = t - horizon  # 슬라이싱이 t-horizon-1까지 포함
         if start_idx < 0:
             start_idx = 0
 
@@ -288,13 +292,18 @@ def calculate_features(df_kf: pd.DataFrame, params: dict = None):
     )
 
     # 5. Residual Std
+    # Rolling 윈도우가 차기 전에는 global std 사용 (magic number 0.01 대신)
     log_resid = np.log(close) - np.log(kf_trend)
-    resid_std = pd.Series(log_resid).rolling(window=params["resid_window"], min_periods=30).std().fillna(0.01).values
+    global_resid_std = np.std(log_resid[~np.isnan(log_resid)])
+    if global_resid_std < 1e-10:
+        global_resid_std = 0.01  # fallback (데이터 문제 시)
+    resid_std = pd.Series(log_resid).rolling(window=params["resid_window"], min_periods=30).std().fillna(global_resid_std).values
 
     return {
         "sigma_hybrid": sigma_hybrid,
         "v_ratio": v_ratio,
         "vel_zscore": vel_zscore,
+        "velocity": velocity,  # 방향 필터용
         "unc_pct": unc_pct,
         "resid_std": resid_std,
         "kf_trend": kf_trend,
@@ -346,6 +355,7 @@ def generate_signals(
     rolling_k_long: np.ndarray,
     rolling_k_short: np.ndarray,
     vel_zscore: np.ndarray,
+    velocity: np.ndarray,  # 방향 필터용
     unc_pct: np.ndarray,
     v_ratio: np.ndarray,
     resid_std: np.ndarray,
@@ -399,10 +409,12 @@ def generate_signals(
         stop_dist = sqrt_s_risk[i]
 
         if position == 0:
-            # Check entry conditions + rolling K/MAE availability
-            long_signal = (vel_zscore[i] > entry_z and unc_pct[i] < unc_pct_max
+            # Check entry conditions + rolling K/MAE availability + 방향 필터
+            long_signal = (vel_zscore[i] > entry_z and velocity[i] > 0  # 방향 필터 추가
+                          and unc_pct[i] < unc_pct_max
                           and not np.isnan(rolling_k_long[i]) and not np.isnan(rolling_mae_long[i]))
-            short_signal = (vel_zscore[i] < -entry_z and unc_pct[i] < unc_pct_max
+            short_signal = (vel_zscore[i] < -entry_z and velocity[i] < 0  # 방향 필터 추가
+                           and unc_pct[i] < unc_pct_max
                            and not np.isnan(rolling_k_short[i]) and not np.isnan(rolling_mae_short[i]))
 
             if long_signal:
@@ -644,6 +656,7 @@ def run_backtest_go(df: pd.DataFrame, params: dict = None):
         rolling_k_long=rolling_k_long,
         rolling_k_short=rolling_k_short,
         vel_zscore=features["vel_zscore"],
+        velocity=features["velocity"],  # 방향 필터용
         unc_pct=features["unc_pct"],
         v_ratio=features["v_ratio"],
         resid_std=features["resid_std"],
@@ -667,7 +680,9 @@ def run_backtest_go(df: pd.DataFrame, params: dict = None):
     go_features = prepare_go_features(df_kf)
 
     # Get timestamps
-    if "timestamp" in df_kf.columns:
+    if "start_time" in df_kf.columns:
+        timestamps = df_kf["start_time"].values.astype(np.int64)
+    elif "timestamp" in df_kf.columns:
         timestamps = df_kf["timestamp"].values.astype(np.int64)
     elif "open_time" in df_kf.columns:
         timestamps = df_kf["open_time"].values.astype(np.int64)
@@ -731,6 +746,9 @@ def run_backtest_go(df: pd.DataFrame, params: dict = None):
     bar_returns = np.zeros(len(equity))
     bar_returns[1:] = np.diff(equity) / (equity[:-1] + 1e-10)
 
+    # timestamps를 equity 길이에 맞춤
+    timestamps = timestamps[:len(equity)]
+
     return {
         "total_trades": result.total_trades,
         "total_pnl": result.total_pnl,
@@ -751,6 +769,7 @@ def run_backtest_go(df: pd.DataFrame, params: dict = None):
         "max_k": max_k,
         "equity_curve": equity,
         "bar_returns": bar_returns,
+        "timestamps": timestamps,
     }
 
 
@@ -758,43 +777,94 @@ def run_backtest_go(df: pd.DataFrame, params: dict = None):
 # Portfolio Metrics
 # ============================================================================
 def calculate_portfolio_metrics(individual_results: dict):
-    """Calculate combined portfolio metrics."""
-    min_len = min(len(m["bar_returns"]) for m in individual_results.values())
+    """
+    Calculate combined portfolio metrics with proper timestamp alignment.
+    - 각 자산의 equity curve를 일자별로 align
+    - 일별 PnL 합산으로 포트폴리오 equity 계산
+    - 원금 $100K 대비 수익률
+    """
+    import pandas as pd
 
-    combined_returns = np.zeros(min_len)
+    # 1. 각 자산의 일자별 equity DataFrame 생성
+    asset_daily_equity = {}
     for symbol, m in individual_results.items():
-        combined_returns += m["bar_returns"][:min_len]
+        timestamps = m["timestamps"]
+        equity = m["equity_curve"]
 
-    initial_capital = 100000.0
-    combined_equity = np.zeros(min_len)
-    combined_equity[0] = initial_capital
+        # timestamp -> datetime -> date
+        dates = pd.to_datetime(timestamps, unit='ms')
+        df = pd.DataFrame({"datetime": dates, "equity": equity})
+        df["date"] = df["datetime"].dt.date
 
-    for i in range(1, min_len):
-        combined_equity[i] = combined_equity[i-1] * (1 + combined_returns[i])
+        # 일자별 마지막 equity (EOD)
+        daily = df.groupby("date")["equity"].last()
+        asset_daily_equity[symbol] = daily
 
-    total_pnl = (combined_equity[-1] - initial_capital) / initial_capital
+    # 2. 전체 날짜 합집합 (intersection → union으로 변경, look-ahead 방지)
+    symbols = list(individual_results.keys())
+    all_dates = asset_daily_equity[symbols[0]].index
+    for symbol in symbols[1:]:
+        all_dates = all_dates.union(asset_daily_equity[symbol].index)
+    all_dates = sorted(all_dates)
 
-    running_max = np.maximum.accumulate(combined_equity)
-    drawdown = (combined_equity - running_max) / running_max
+    if len(all_dates) < 10:
+        return {
+            "total_pnl": 0, "cagr": 0, "max_drawdown": 0,
+            "sharpe": 0, "avg_leverage": 0, "cagr_mdd": 0,
+            "equity_curve": np.array([100000]),
+        }
+
+    # 3. 각 자산의 equity를 합집합 날짜로 reindex + ffill (미싱 데이터는 전일 값)
+    for symbol in symbols:
+        asset_daily_equity[symbol] = asset_daily_equity[symbol].reindex(all_dates).ffill()
+        # 첫 날짜에 데이터 없으면 초기 자본으로 설정
+        if pd.isna(asset_daily_equity[symbol].iloc[0]):
+            asset_daily_equity[symbol].iloc[0] = 100000.0
+            asset_daily_equity[symbol] = asset_daily_equity[symbol].ffill()
+
+    # 4. 각 자산의 일별 PnL 계산 및 합산
+    # 각 자산 $100K씩, 총 초기 자본 = $100K × 자산 수
+    initial_capital = 100000.0 * len(symbols)
+    portfolio_equity = np.zeros(len(all_dates))
+    portfolio_equity[0] = initial_capital
+
+    for i, date in enumerate(all_dates):
+        if i == 0:
+            continue
+
+        prev_date = all_dates[i - 1]
+        daily_pnl = 0
+
+        for symbol in symbols:
+            eq = asset_daily_equity[symbol]
+            prev_eq = eq.loc[prev_date]
+            curr_eq = eq.loc[date]
+            daily_pnl += (curr_eq - prev_eq)  # 각 자산 PnL 합산
+
+        portfolio_equity[i] = portfolio_equity[i - 1] + daily_pnl
+
+    # 4. 성과 지표 계산
+    total_pnl = (portfolio_equity[-1] - initial_capital) / initial_capital
+
+    running_max = np.maximum.accumulate(portfolio_equity)
+    drawdown = (portfolio_equity - running_max) / running_max
     max_dd = np.abs(np.min(drawdown))
 
-    daily_returns = []
-    for i in range(0, len(combined_returns), 6):
-        chunk = combined_returns[i:i+6]
-        if len(chunk) > 0:
-            daily_returns.append(np.sum(chunk))
-
+    # Daily returns for Sharpe
+    daily_returns = np.diff(portfolio_equity) / (portfolio_equity[:-1] + 1e-10)
     if len(daily_returns) > 1:
         sharpe = (np.mean(daily_returns) / (np.std(daily_returns) + 1e-10)) * np.sqrt(252)
     else:
         sharpe = 0.0
 
-    n_years = min_len / (6 * 365)
-    if n_years > 0 and combined_equity[-1] > 0:
-        cagr = (combined_equity[-1] / initial_capital) ** (1 / n_years) - 1
+    # CAGR
+    n_years = len(all_dates) / 365.0
+    if n_years > 0 and portfolio_equity[-1] > 0:
+        cagr = (portfolio_equity[-1] / initial_capital) ** (1 / n_years) - 1
     else:
         cagr = 0.0
 
+    # Average leverage = sum of avg_size
     total_avg_size = sum(m["avg_size"] for m in individual_results.values())
 
     return {
@@ -804,7 +874,7 @@ def calculate_portfolio_metrics(individual_results: dict):
         "sharpe": sharpe,
         "avg_leverage": total_avg_size,
         "cagr_mdd": cagr / max_dd if max_dd > 0 else 0,
-        "equity_curve": combined_equity,
+        "equity_curve": portfolio_equity,
     }
 
 

@@ -351,22 +351,6 @@ func (m *MetricsCalculator) calculateMaxDrawdown(curve []float64) float64 {
 	return maxDD
 }
 
-// CalculateRollingMetrics computes metrics over a rolling window.
-// Note: This calculates metrics without mark-to-market equity curve.
-func (m *MetricsCalculator) CalculateRollingMetrics(trades []Trade, windowSize int) []Result {
-	if len(trades) < windowSize {
-		return nil
-	}
-
-	results := make([]Result, len(trades)-windowSize+1)
-	for i := range results {
-		windowTrades := trades[i : i+windowSize]
-		results[i] = m.Calculate(windowTrades, []Bar{}) // No equity curve for rolling
-	}
-
-	return results
-}
-
 // Sortino calculates the Sortino ratio (downside deviation only) from daily returns.
 func Sortino(dailyReturns []float64) float64 {
 	if len(dailyReturns) == 0 {

@@ -83,7 +83,8 @@ func (r *Runner) RunWithData(bars []Bar, signals []Signal, sizes []float64, stop
 	r.executor.Reset()
 
 	trades := make([]Trade, 0)
-	cumulativePnL := 0.0
+	initialEquity := r.config.InitialCapital
+	currentEquity := initialEquity
 	stoppedEarly := false
 	stopBar := len(bars)
 
@@ -108,10 +109,12 @@ func (r *Runner) RunWithData(bars []Bar, signals []Signal, sizes []float64, stop
 		trade := r.executor.ProcessBar(i, bars[i], signal, size, stopPrice)
 		if trade != nil {
 			trades = append(trades, *trade)
-			cumulativePnL += trade.PnL * trade.Size // Weighted by size
+			// Geometric equity update: equity *= (1 + pnl * size)
+			currentEquity *= (1.0 + trade.PnL*trade.Size)
 
-			// Early stop if loss exceeds threshold
-			if r.config.MaxLossPct > 0 && cumulativePnL < -r.config.MaxLossPct {
+			// Early stop if drawdown exceeds threshold (equity-based)
+			drawdown := (initialEquity - currentEquity) / initialEquity
+			if r.config.MaxLossPct > 0 && drawdown > r.config.MaxLossPct {
 				stoppedEarly = true
 				stopBar = i
 				break
@@ -155,9 +158,10 @@ func (r *Runner) loadSignals(path string) ([]Signal, []float64, []float64, error
 	reader := parquet.NewReader(file)
 	defer reader.Close()
 
-	signals := make([]Signal, 0, reader.NumRows())
-	sizes := make([]float64, 0, reader.NumRows())
-	stopPrices := make([]float64, 0, reader.NumRows())
+	numRows := int(reader.NumRows())
+	signals := make([]Signal, 0, numRows)
+	sizes := make([]float64, 0, numRows)
+	stopPrices := make([]float64, 0, numRows)
 	hasSizes := false
 	hasStopPrices := false
 
@@ -183,15 +187,10 @@ func (r *Runner) loadSignals(path string) ([]Signal, []float64, []float64, error
 	}
 
 	// If no sizes were set, return nil to indicate default sizing
+	// size=0 means no position (exit/flat), handled in RunWithData
 	var finalSizes []float64
 	if hasSizes {
 		finalSizes = sizes
-		// Replace 0 sizes with 1.0 (default)
-		for i := range finalSizes {
-			if finalSizes[i] <= 0 {
-				finalSizes[i] = 1.0
-			}
-		}
 	}
 
 	// If no stop prices were set, return nil
@@ -214,7 +213,7 @@ func (r *Runner) loadFeatures(path string) ([]Bar, error) {
 	reader := parquet.NewReader(file)
 	defer reader.Close()
 
-	bars := make([]Bar, 0, reader.NumRows())
+	bars := make([]Bar, 0, int(reader.NumRows()))
 	for {
 		var record FeatureRecord
 		err := reader.Read(&record)

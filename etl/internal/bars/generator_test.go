@@ -60,7 +60,7 @@ func TestWarmupPeriod(t *testing.T) {
 	}
 
 	// Threshold should now be calculated
-	expectedThreshold := dailyVolume / float64(TargetBarsPerDay)
+	expectedThreshold := dailyVolume / float64(DefaultTargetBarsPerDay)
 	threshold := g.GetCurrentThreshold()
 
 	// Allow some tolerance for accumulated volume variations
@@ -342,7 +342,7 @@ func TestThresholdCalculation(t *testing.T) {
 	g.initializeEMA()
 
 	threshold := g.calculateThreshold()
-	expectedThreshold := 1_000_000_000.0 / float64(TargetBarsPerDay) // $1B / 50 = $20M
+	expectedThreshold := 1_000_000_000.0 / float64(DefaultTargetBarsPerDay) // $1B / 50 = $20M
 
 	if threshold != expectedThreshold {
 		t.Errorf("Expected threshold %.2f, got %.2f", expectedThreshold, threshold)
