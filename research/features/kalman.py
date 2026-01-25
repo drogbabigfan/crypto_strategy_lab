@@ -43,9 +43,11 @@ class KalmanConfig:
 
     # === NIS-based Q Adjustment ===
     # Boosts Q when predictions are wrong (NIS > 1)
+    # Q_new = Q_base * min(max_cap, NIS * alpha)
     use_nis_adaptive: bool = True   # Enable NIS-based adaptive Q (recommended with PWNA)
     nis_window: int = 10            # Window for NIS smoothing
-    nis_boost_factor: float = 2.0   # Max boost when NIS is high
+    nis_alpha: float = 3.0          # Sensitivity multiplier (crypto: 2.0~5.0)
+    nis_boost_factor: float = 20.0  # Max boost cap (crypto: 10~50)
 
     # === PWNA Model (Piecewise White Noise Acceleration) ===
     # Q = σ_a² * [[dt⁴/4, dt³/2], [dt³/2, dt²]]
@@ -53,6 +55,16 @@ class KalmanConfig:
     # 위치-속도 오차를 물리적으로 커플링 (off-diagonal ≠ 0)
     use_pwna_q: bool = True         # PWNA 모델 사용 (권장)
     sigma_a_scale: float = 0.4      # 가속도 노이즈 스케일 (최적화됨)
+
+    # === Directional Innovation Mapping ===
+    # σ_a² = σ_base² * exp(-η * std_innovation)
+    # - 하락 (innov < 0): exp(-negative) > 1 → Q 증폭 (빠른 반응)
+    # - 상승 (innov > 0): exp(-positive) < 1 → Q 축소 (부드러운 추종)
+    # "Fear is faster than greed" 비대칭성을 모델에 내장
+    use_directional_q: bool = False     # Directional Q 사용 (실험적)
+    directional_eta: float = 0.5        # 민감도 파라미터 (0.3~1.0 권장)
+    directional_max_boost: float = 5.0  # 최대 부스트 캡
+    directional_min_boost: float = 0.2  # 최소 부스트 (상승 시)
 
     # Price type
     use_typical_price: bool = True  # Use (H+L+C)/3 instead of Close
@@ -236,28 +248,62 @@ class AdaptiveKalmanFilter:
 
     def _get_nis_boost(self, nis_history: list) -> float:
         """
-        Get Q boost factor from NIS history.
+        Get Q boost factor from CURRENT (instant) NIS.
 
-        Uses smoothed NIS over recent window to avoid overreacting.
+        Uses instant NIS for immediate reaction to prediction errors.
+        Q_new = Q_base * min(max_cap, current_nis * alpha)
 
         Args:
-            nis_history: Recent NIS values
+            nis_history: Recent NIS values (uses last value only)
 
         Returns:
             Boost factor (>= 1.0)
         """
-        if len(nis_history) < 2:
+        if len(nis_history) < 1:
             return 1.0
 
-        window = min(len(nis_history), self.config.nis_window)
-        recent_nis = np.array(nis_history[-window:])
+        # Use CURRENT NIS, not mean - for instant reaction
+        current_nis = nis_history[-1]
 
-        # Mean NIS
-        mean_nis = np.mean(recent_nis)
+        # Instant boost: current_nis * alpha, capped at max_cap
+        # NIS < 1: normal state, boost stays low
+        # NIS > 1: prediction error, boost = NIS * alpha immediately
+        raw_boost = current_nis * self.config.nis_alpha
+        boost = max(1.0, min(raw_boost, self.config.nis_boost_factor))
 
-        # If NIS > 1, boost Q proportionally
-        # Clamp to max boost factor
-        boost = max(1.0, min(mean_nis, self.config.nis_boost_factor))
+        return boost
+
+    def _get_directional_boost(self, std_innovation: float) -> float:
+        """
+        Get directional Q boost from standardized innovation.
+
+        Uses exponential mapping to encode direction:
+        σ_a² = σ_base² * exp(-η * std_innovation)
+
+        - 가격 급락 (std_innov < 0): exp(-negative) > 1 → Q 증폭
+        - 가격 상승 (std_innov > 0): exp(-positive) < 1 → Q 축소
+
+        This encodes "Fear is faster than greed" asymmetry.
+
+        Args:
+            std_innovation: Standardized innovation (ε / √S)
+
+        Returns:
+            Directional boost factor
+        """
+        if np.isnan(std_innovation):
+            return 1.0
+
+        cfg = self.config
+        eta = cfg.directional_eta
+
+        # exp(-η * std_innovation)
+        # std_innov < 0 (가격 하락) → exp(positive) > 1
+        # std_innov > 0 (가격 상승) → exp(negative) < 1
+        raw_boost = np.exp(-eta * std_innovation)
+
+        # Clamp to [min, max]
+        boost = np.clip(raw_boost, cfg.directional_min_boost, cfg.directional_max_boost)
 
         return boost
 
@@ -312,6 +358,59 @@ class AdaptiveKalmanFilter:
 
         return q_matrix
 
+    def _get_f_matrix(self, dt: float) -> np.ndarray:
+        """
+        Get state transition matrix F for given time delta.
+
+        F = [[1, dt],
+             [0, 1 ]]
+
+        Args:
+            dt: Time delta (normalized, e.g., hours)
+
+        Returns:
+            2x2 F matrix
+        """
+        return np.array([[1.0, dt],
+                        [0.0, 1.0]])
+
+    def _get_q_matrix_with_dt(
+        self,
+        base_q: float,
+        dt: float,
+        nis_boost: float = 1.0
+    ) -> np.ndarray:
+        """
+        Get Q matrix using PWNA model with actual time delta.
+
+        PWNA Model:
+        Q = σ_a² * [[Δt⁴/4, Δt³/2],
+                    [Δt³/2, Δt²  ]]
+
+        Args:
+            base_q: Base Q value (σ_a² estimate)
+            dt: Time delta (normalized)
+            nis_boost: Boost factor from NIS (>= 1.0)
+
+        Returns:
+            2x2 PWNA Q matrix
+        """
+        cfg = self.config
+        sigma_a_sq = base_q * cfg.sigma_a_scale * nis_boost
+
+        if cfg.use_pwna_q:
+            q_matrix = sigma_a_sq * np.array([
+                [dt**4 / 4, dt**3 / 2],
+                [dt**3 / 2, dt**2]
+            ])
+        else:
+            q_matrix = np.array([
+                [sigma_a_sq * dt**2, 0.0],
+                [0.0, sigma_a_sq]
+            ])
+
+        return np.maximum(q_matrix, cfg.min_q)
+
     def filter(
         self,
         df: pd.DataFrame
@@ -320,13 +419,13 @@ class AdaptiveKalmanFilter:
         Apply Adaptive Kalman Filter to price data.
 
         Args:
-            df: DataFrame with 'close' (and optionally 'high', 'low')
+            df: DataFrame with 'close' (and optionally 'high', 'low', 'log_duration')
 
         Returns:
             DataFrame with Kalman filter outputs:
             - kf_trend: Filtered trend (a posteriori state estimate)
             - kf_trend_pred: Predicted trend (a priori state estimate)
-            - kf_velocity: Estimated velocity/momentum
+            - kf_velocity: Estimated velocity/momentum (per hour)
             - kf_deviation: Price deviation from trend (z - trend)
             - kf_deviation_pct: Deviation as percentage
             - kf_gain: Kalman gain (filter responsiveness)
@@ -360,16 +459,29 @@ class AdaptiveKalmanFilter:
 
         n = len(prices)
 
+        # Get time delta (in hours) for each bar
+        # Default: 6 hours (typical TIB bar)
+        if 'log_duration' in df.columns:
+            duration_seconds = np.exp(df['log_duration'].values)
+            dt_hours = duration_seconds / 3600.0  # Convert to hours
+        else:
+            dt_hours = np.full(n, 6.0)  # Default 6 hours
+
         # Output arrays (in log space if use_log_price)
         trend = np.full(n, np.nan)
         trend_pred = np.full(n, np.nan)  # a priori state estimate
         velocity = np.full(n, np.nan)
+        velocity_var = np.full(n, np.nan)  # P[1,1] - velocity variance for Z-score
         kalman_gain = np.full(n, np.nan)
         uncertainty = np.full(n, np.nan)  # P (a posteriori)
         uncertainty_pred = np.full(n, np.nan)  # P_pred (a priori) - for stop calculation
         innovation = np.full(n, np.nan)  # y = z - H*x_pred
         innovation_cov = np.full(n, np.nan)  # S_trend = H*P_pred*H^T + R_close (for update)
         innovation_cov_risk = np.full(n, np.nan)  # S_risk = H*P_pred*H^T + R_parkinson (for stop)
+        nis_arr = np.full(n, np.nan)  # Normalized Innovation Squared
+        nis_boost_arr = np.full(n, np.nan)  # Applied NIS boost factor
+        r_trend_arr = np.full(n, np.nan)  # R_trend (close-based measurement noise)
+        r_risk_arr = np.full(n, np.nan)  # R_risk (Parkinson-based measurement noise)
 
         # Find first valid (non-NaN) price for initialization
         first_valid_idx = 0
@@ -389,24 +501,30 @@ class AdaptiveKalmanFilter:
         vel_history = []
         # NIS history for adaptive Q
         nis_history = []
+        # Std innovation history for directional Q
+        std_innov_history = []
         initialized = False
 
         for i in range(n):
             z = prices[i]  # Observation
 
             # === HANDLE NaN: Skip update, only predict ===
+            # Get time delta for this bar
+            dt = dt_hours[i]
+
             if np.isnan(z):
                 if not initialized:
                     # Not yet initialized, skip entirely
                     continue
 
                 # Prediction step only (no observation)
-                x_pred = self.F @ x
+                F_t = self._get_f_matrix(dt)
+                x_pred = F_t @ x
                 Q_t = self._estimate_q(prices, np.array(vel_history), i)
                 # Use NIS boost even for prediction-only steps
                 nis_boost = self._get_nis_boost(nis_history) if self.config.use_nis_adaptive else 1.0
-                Q_matrix = self._get_q_matrix(Q_t, nis_boost)
-                P_pred = self.F @ P @ self.F.T + Q_matrix
+                Q_matrix = self._get_q_matrix_with_dt(Q_t, dt, nis_boost)
+                P_pred = F_t @ P @ F_t.T + Q_matrix
 
                 # Use prediction as state (no update)
                 x = x_pred
@@ -416,6 +534,7 @@ class AdaptiveKalmanFilter:
                 trend_pred[i] = x_pred[0]
                 trend[i] = x[0]
                 velocity[i] = x[1]
+                velocity_var[i] = P[1, 1]  # Velocity variance for Z-score
                 kalman_gain[i] = 0.0  # No update happened
                 uncertainty[i] = P[0, 0]
                 uncertainty_pred[i] = P_pred[0, 0]
@@ -428,20 +547,38 @@ class AdaptiveKalmanFilter:
                 initialized = True
 
             # === PREDICTION STEP ===
+            # Get F matrix for current time delta
+            F_t = self._get_f_matrix(dt)
+
             # x_pred = F * x
-            x_pred = self.F @ x
+            x_pred = F_t @ x
 
             # Estimate adaptive Q
             Q_t = self._estimate_q(prices, np.array(vel_history), i)
 
-            # Get NIS boost factor for adaptive Q
-            nis_boost = self._get_nis_boost(nis_history) if self.config.use_nis_adaptive else 1.0
+            # Get Q boost factor (NIS-based or Directional)
+            if self.config.use_directional_q and len(std_innov_history) > 0:
+                # Directional boost: exp(-η * std_innovation)
+                # Uses previous bar's std_innovation
+                prev_std_innov = std_innov_history[-1]
+                directional_boost = self._get_directional_boost(prev_std_innov)
+                # Combine with NIS boost if enabled
+                if self.config.use_nis_adaptive:
+                    nis_boost = self._get_nis_boost(nis_history)
+                    # Use max of both (aggressive) or multiply (very aggressive)
+                    q_boost = max(nis_boost, directional_boost)
+                else:
+                    q_boost = directional_boost
+                nis_boost = q_boost  # Store for output
+            else:
+                # Original NIS-only boost
+                nis_boost = self._get_nis_boost(nis_history) if self.config.use_nis_adaptive else 1.0
 
-            # Use PWNA Q matrix (with optional NIS boost)
-            Q_matrix = self._get_q_matrix(Q_t, nis_boost)
+            # Use PWNA Q matrix with actual time delta (with optional boost)
+            Q_matrix = self._get_q_matrix_with_dt(Q_t, dt, nis_boost)
 
             # P_pred = F * P * F^T + Q
-            P_pred = self.F @ P @ self.F.T + Q_matrix
+            P_pred = F_t @ P @ F_t.T + Q_matrix
 
             # === UPDATE STEP (Dual-Eye System) ===
             # Eye 1: Trend Eye (Close-based R) - for smooth trend tracking
@@ -462,6 +599,14 @@ class AdaptiveKalmanFilter:
             # Compute and store NIS for adaptive Q adjustment (using trend S)
             nis = self._compute_nis(y, S_trend)
             nis_history.append(nis)
+            nis_arr[i] = nis
+            nis_boost_arr[i] = nis_boost
+            r_trend_arr[i] = R_trend
+            r_risk_arr[i] = R_risk
+
+            # Store std_innovation for directional Q (next bar)
+            std_innov_current = y / (np.sqrt(S_trend) + 1e-10)
+            std_innov_history.append(std_innov_current)
 
             # Kalman Gain: K = P_pred * H^T * S_trend^(-1)
             K = (P_pred @ self.H.T) / S_trend
@@ -477,6 +622,7 @@ class AdaptiveKalmanFilter:
             trend_pred[i] = x_pred[0]  # a priori estimate (prediction)
             trend[i] = x[0]
             velocity[i] = x[1]
+            velocity_var[i] = P[1, 1]  # Velocity variance for Z-score
             kalman_gain[i] = K[0, 0]
             uncertainty[i] = P[0, 0]  # P (a posteriori)
             uncertainty_pred[i] = P_pred[0, 0]  # P_pred (a priori)
@@ -503,7 +649,8 @@ class AdaptiveKalmanFilter:
         result = df.copy()
         result['kf_trend'] = trend_original
         result['kf_trend_pred'] = trend_pred_original
-        result['kf_velocity'] = velocity  # Keep in log space (log-return per period)
+        result['kf_velocity'] = velocity  # In log space (log-return per hour, time-normalized)
+        result['kf_velocity_var'] = velocity_var  # P[1,1] - velocity variance
         result['kf_deviation'] = deviation
         result['kf_deviation_pct'] = deviation_pct
         result['kf_gain'] = kalman_gain
@@ -512,10 +659,18 @@ class AdaptiveKalmanFilter:
         result['kf_innovation_cov'] = innovation_cov  # S_trend = P_pred + R_close (for update)
         result['kf_innovation_cov_risk'] = innovation_cov_risk  # S_risk = P_pred + R_parkinson (for stop!)
         result['kf_innovation'] = innovation  # Measurement residual (log space)
+        # NIS and NIS boost for short signal triggers
+        result['kf_nis'] = nis_arr  # Normalized Innovation Squared
+        result['kf_nis_boost'] = nis_boost_arr  # Applied NIS boost factor
+        # Dual-Eye R values for asymmetry detection
+        result['kf_r_trend'] = r_trend_arr  # R_trend (close-based)
+        result['kf_r_risk'] = r_risk_arr  # R_risk (Parkinson-based)
         # Standardized Innovation: innovation / sqrt(S_trend)
         result['kf_std_innovation'] = innovation / (np.sqrt(innovation_cov) + 1e-10)
         # Stop Distance (k=3): 3 * sqrt(S_risk) - ready to use!
         result['kf_stop_distance'] = 3.0 * np.sqrt(innovation_cov_risk)
+        # Velocity Z-Score: velocity / sqrt(P[1,1]) - for statistically significant trend
+        result['kf_velocity_zscore'] = velocity / (np.sqrt(velocity_var) + 1e-10)
 
         # Normalized signal: deviation z-score
         signal_window = self.config.r_window
@@ -586,6 +741,9 @@ class KalmanFeatureGenerator:
         use_nis_adaptive: bool = True,  # NIS 기반 적응형 Q (권장)
         use_pwna_q: bool = True,        # PWNA Q 행렬 (권장)
         sigma_a_scale: float = 0.4,     # 가속도 노이즈 스케일
+        # Directional Q parameters
+        use_directional_q: bool = False,  # Directional Q (실험적)
+        directional_eta: float = 0.5,     # 민감도 (0.3~1.0)
     ):
         """
         Args:
@@ -598,6 +756,8 @@ class KalmanFeatureGenerator:
             use_nis_adaptive: Use NIS-based adaptive Q (recommended)
             use_pwna_q: Use PWNA Q matrix (proper pos-vel coupling)
             sigma_a_scale: Acceleration noise scale for PWNA
+            use_directional_q: Use directional innovation mapping (experimental)
+            directional_eta: Sensitivity for directional Q (0.3~1.0)
         """
         self.config = KalmanConfig(
             r_window=r_window,
@@ -609,6 +769,8 @@ class KalmanFeatureGenerator:
             use_nis_adaptive=use_nis_adaptive,
             use_pwna_q=use_pwna_q,
             sigma_a_scale=sigma_a_scale,
+            use_directional_q=use_directional_q,
+            directional_eta=directional_eta,
         )
         self.kf = AdaptiveKalmanFilter(self.config)
 
@@ -630,6 +792,8 @@ class KalmanFeatureGenerator:
             'kf_trend',
             'kf_trend_pred',
             'kf_velocity',
+            'kf_velocity_var',          # P[1,1] - velocity variance
+            'kf_velocity_zscore',       # velocity / sqrt(P[1,1]) - for significant trend detection
             'kf_deviation',
             'kf_deviation_pct',
             'kf_gain',
@@ -637,6 +801,11 @@ class KalmanFeatureGenerator:
             'kf_uncertainty_pred',      # P_pred (a priori)
             'kf_innovation_cov',        # S_trend = P_pred + R_close
             'kf_innovation_cov_risk',   # S_risk = P_pred + R_parkinson (for stop!)
+            'kf_innovation',            # Measurement residual (log space)
+            'kf_nis',                   # Normalized Innovation Squared
+            'kf_nis_boost',             # Applied NIS boost factor
+            'kf_r_trend',               # R_trend (close-based measurement noise)
+            'kf_r_risk',                # R_risk (Parkinson-based measurement noise)
             'kf_stop_distance',         # 3 * sqrt(S_risk) - ready to use!
             'kf_signal',
             'kf_std_innovation',
